@@ -1,0 +1,7 @@
+data/*
+.DS_Store
+.vscode/*
+scratch.json
+jobs/invocation-lambda/*
+resources/videos/graves-bb-capstone-full.mp4
+resources/videos/graves-bb-capstone-short.mp4
