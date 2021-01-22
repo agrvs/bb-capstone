@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates the platform tools for an NTM model building workflow
+
+Parameters:
+
+  ToolsBucketName:
+    Description: The name of the S3 tools bucket that should be created
+    Type: String
+  DataBucketName:
+    Description: The name of the S3 data bucket that should be created
+    Type: String
+  ECRAccessArn:
+    Description: The name of the IAM role you want to have access to the ECR processing job repo
+    Type: String
+
+Resources:
+
+  ToolsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref ToolsBucketName
+      AccessControl: Private
+      VersioningConfiguration:
+        Status: Enabled
+
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref DataBucketName
+      AccessControl: Private
+      VersioningConfiguration:
+        Status: Enabled
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement: 
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal: 
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub arn:aws:s3:::${DataBucket}
+          - 
+            Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal: 
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${DataBucket}/cloudtrail/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  EventCloudTrail:
+    DependsOn:
+      - DataBucketPolicy
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: S3Event-Trail
+      S3BucketName: !Ref DataBucketName
+      S3KeyPrefix: cloudtrail
+      IsLogging: True
+      EventSelectors:
+        - DataResources: 
+            - Type: AWS::S3::Object
+              Values: 
+                - !Sub arn:aws:s3:::${DataBucketName}/raw
+          ReadWriteType: All
+
+  ProcessJobContainerRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    Properties: 
+      ImageTagMutability: MUTABLE
+      RepositoryName: processing-job
+      RepositoryPolicyText:
+        Version: 2012-10-17
+        Statement:
+          - Sid: TroubleshootAccess
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - "*"
+          - Sid: 1S-AdminsAccess
+            Effect: Allow
+            Principal:
+              AWS: !Ref ECRAccessArn
+            Action:
+              - "*"
+          - Sid: SageMakerAccess
+            Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action:
+              - "*"

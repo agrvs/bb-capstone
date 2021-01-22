@@ -1,0 +1,207 @@
+{
+  "Comment": "A State Machine to manage ingestion, transformation, training, and updating production NTM resources.",
+  "StartAt": "Ingestion Job",
+  "States": {
+    "Ingestion Job": {
+        "Type": "Task",
+        "Resource": "arn:aws:states:::glue:startJobRun.sync",
+        "Parameters": {
+            "JobName": "${IngestJob}",
+            "Arguments": {
+                "--s3_bucket.$": "$.detail.requestParameters.bucketName",
+                "--s3_object_key.$": "$.detail.requestParameters.key"
+            }
+        },
+        "ResultPath": "$.ingest",
+        "OutputPath": "$",
+        "Next": "Preparation Job"
+    },
+    "Preparation Job": {
+        "Type": "Task",
+        "Resource": "arn:aws:states:::glue:startJobRun.sync",
+        "Parameters": {
+            "JobName": "${PrepareJob}",
+            "Arguments": {
+                "--s3_bucket.$": "$.detail.requestParameters.bucketName",
+                "--train_percent": "0.8"
+            }
+        },
+        "ResultPath": "$.prepare",
+        "OutputPath": "$",
+        "Next": "Processing Job"
+    },
+    "Processing Job": {
+        "Type": "Task",
+        "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
+        "Parameters": {
+            "AppSpecification": {
+                "ImageUri": "676084258492.dkr.ecr.us-west-2.amazonaws.com/processing-job:latest"
+            },
+            "ProcessingResources": {
+                "ClusterConfig": {
+                    "InstanceCount": 1,
+                    "InstanceType": "ml.m5.2xlarge",
+                    "VolumeSizeInGB": 10
+                }
+            },
+            "RoleArn": "${SMRole}",
+            "ProcessingJobName.$": "$.id"
+        },
+        "ResultPath": "$.process",
+        "OutputPath": "$",
+        "Next": "Training Job"
+    },
+    "Training Job": {
+        "Type": "Task",
+        "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
+        "Parameters": {
+            "TrainingJobName.$": "$.id",
+            "RoleArn": "${SMRole}",
+            "ResourceConfig": {
+                "InstanceCount": 12,
+                "InstanceType": "ml.c4.xlarge",
+                "VolumeSizeInGB": 5
+            },
+            "HyperParameters": {
+                "epochs": "100",
+                "feature_dim": "524",
+                "mini_batch_size": "600",
+                "num_topics": "10",
+                "sub_sample": "0.7"
+            },
+            "AlgorithmSpecification": {
+                "TrainingImage": "174872318107.dkr.ecr.us-west-2.amazonaws.com/ntm:latest",
+                "TrainingInputMode": "Pipe"
+            },
+            "EnableManagedSpotTraining": true,
+            "OutputDataConfig": {
+                "S3OutputPath.$": "States.Format('s3://{}/models', $.detail.requestParameters.bucketName)"
+            },
+            "StoppingCondition": {
+                "MaxRuntimeInSeconds": 900,
+                "MaxWaitTimeInSeconds": 900
+            },
+            "InputDataConfig": [{
+                    "ChannelName": "train",
+                    "ContentType": "application/x-recordio-protobuf",
+                    "InputMode": "Pipe",
+                    "DataSource": {
+                        "S3DataSource": {
+                            "S3DataType": "S3Prefix",
+                            "S3Uri.$": "States.Format('s3://{}/processed/train/', $.detail.requestParameters.bucketName)",
+                            "S3DataDistributionType": "ShardedByS3Key"
+                        }
+                    }
+                },
+                {
+                    "ChannelName": "validation",
+                    "ContentType": "application/x-recordio-protobuf",
+                    "InputMode": "Pipe",
+                    "DataSource": {
+                        "S3DataSource": {
+                            "S3DataType": "S3Prefix",
+                            "S3Uri.$": "States.Format('s3://{}/processed/validation/', $.detail.requestParameters.bucketName)",
+                            "S3DataDistributionType": "FullyReplicated"
+                        }
+                    }
+                },
+                {
+                    "ChannelName": "test",
+                    "ContentType": "application/x-recordio-protobuf",
+                    "InputMode": "Pipe",
+                    "DataSource": {
+                        "S3DataSource": {
+                            "S3DataType": "S3Prefix",
+                            "S3Uri.$": "States.Format('s3://{}/processed/test/', $.detail.requestParameters.bucketName)",
+                            "S3DataDistributionType": "ShardedByS3Key"
+                        }
+                    }
+                },
+                {
+                    "ChannelName": "auxiliary",
+                    "ContentType": "text/plain",
+                    "InputMode": "File",
+                    "DataSource": {
+                        "S3DataSource": {
+                            "S3DataType": "S3Prefix",
+                            "S3Uri.$": "States.Format('s3://{}/processed/vocab.txt', $.detail.requestParameters.bucketName)",
+                            "S3DataDistributionType": "FullyReplicated"
+                        }
+                    }
+                }
+            ]
+        },
+        "ResultPath": "$.train",
+        "OutputPath": "$",
+        "Next": "Create Model"
+    },
+    "Create Model": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:createModel",
+      "Parameters": {
+        "ModelName.$": "States.Format('ntm-automated-model-{}', $.id)",
+        "ExecutionRoleArn": "${SMRole}",
+        "PrimaryContainer": {
+          "ContainerHostname": "automated-ntm-model",
+          "Image": "174872318107.dkr.ecr.us-west-2.amazonaws.com/ntm:latest",
+          "ImageConfig": {
+            "RepositoryAccessMode": "Platform"
+          },
+          "Mode": "SingleModel",
+          "ModelDataUrl.$": "$.train.ModelArtifacts.S3ModelArtifacts"
+        }
+      },
+      "ResultPath": "$.model",
+      "OutputPath": "$",
+      "Next": "Create Endpoint Config"
+    },
+    "Create Endpoint Config": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:createEndpointConfig",
+      "Parameters": {
+        "EndpointConfigName.$": "States.Format('ntm-automated-endpoint-{}', $.id)",
+        "ProductionVariants": [{
+          "InitialInstanceCount": 1,
+          "InstanceType": "ml.m4.xlarge",
+          "ModelName.$": "States.Format('ntm-automated-model-{}', $.id)",
+          "VariantName": "ntm-production-variant"
+        }]
+      },
+      "ResultPath": "$.endpointconfig",
+      "OutputPath": "$",
+      "Next": "Create Endpoint"
+    },
+    "Create Endpoint": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:createEndpoint",
+      "Parameters": {
+        "EndpointConfigName.$": "States.Format('ntm-automated-endpoint-{}', $.id)",
+        "EndpointName": "ntm-automated-endpoint"
+      },
+      "ResultPath": "$.endpoint",
+      "OutputPath": "$",
+      "Next": "End",
+      "Catch": [{
+        "ErrorEquals": [ "SageMaker.AmazonSageMakerException" ],
+        "Next": "Update Endpoint",
+        "ResultPath": "$.error"
+      }]
+    },
+    "Update Endpoint": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:updateEndpoint",
+      "Parameters": {
+        "EndpointConfigName.$": "States.Format('ntm-automated-endpoint-{}', $.id)",
+        "EndpointName": "ntm-automated-endpoint"
+      },
+      "ResultPath": "$.endpoint",
+      "OutputPath": "$",
+      "Next": "End"
+    },
+    "End": {
+        "Type": "Pass",
+        "Result": "done",
+        "End": true
+    }
+  }
+}

@@ -1,0 +1,517 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates the necessary resources for an NTM model
+
+
+Parameters:
+
+  ToolsBucketName:
+    Description: The name of the S3 tools bucket that should be created
+    Type: String
+  DataBucketName:
+    Description: The name of the S3 data bucket that should be created
+    Type: String
+  SageMakerRoleName:
+    Description: The name of the SageMaker execution role that should be created
+    Type: String
+  GlueCrawlerRoleName:
+    Description: The name of the Glue crawler role that should be created
+    Type: String
+  StateMachineName:
+    Description: The name of the StepFunctions state machine that should be created
+    Type: String
+  GlueIngestionJobRoleName:
+    Description: The name of the Glue job role that should be created
+    Type: String
+  ECRAccessArn:
+    Description: The name of the IAM role you want to have access to the ECR processing job repo
+    Type: String
+
+
+Resources:
+
+#############
+# IAM Roles #
+#############
+
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref SageMakerRoleName
+      Description: Allows
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/AWSCodeCommitPowerUser
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref GlueCrawlerRoleName
+      Description: Allows
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+  GlueIngestionJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref GlueIngestionJobRoleName
+      Description: Grants necessary permissions to the Amazon Review ingestion Glue job.
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+  StateMachineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${StateMachineName}-Execution-Role
+      Description: Allows
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: NTM-EventBridge-Execution-Role
+      Description: Allows
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: StartAccess-StateMachine
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref NtmStateMachine
+
+################
+# IAM Policies #
+################
+
+  ListBucketPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ReadAccess-ProjectBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::${DataBucketName}
+              - !Sub arn:aws:s3:::${ToolsBucketName}
+      Roles:
+        - !Ref SageMakerRoleName
+        - !Ref GlueCrawlerRole
+        - !Ref GlueIngestionJobRoleName
+
+  WriteObjectsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: WriteAccess-ProjectObjects
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource:
+              - !Sub arn:aws:s3:::${DataBucketName}/*
+              - !Sub arn:aws:s3:::${ToolsBucketName}/*
+      Roles:
+        - !Ref SageMakerExecutionRole
+        - !Ref GlueCrawlerRole
+        - !Ref GlueIngestionJobRoleName
+
+  StateMachinePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: StateManagement
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: DeliveryAccessCloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogDelivery
+              - logs:GetLogDelivery
+              - logs:UpdateLogDelivery
+              - logs:DeleteLogDelivery
+              - logs:ListLogDeliveries
+              - logs:PutResourcePolicy
+              - logs:DescribeResourcePolicies
+              - logs:DescribeLogGroups
+            Resource:
+              - "*"
+          - Sid: JobRunAccessGlue
+            Effect: Allow
+            Action:
+              - glue:StartJobRun
+              - glue:GetJobRun
+              - glue:GetJobRuns
+              - glue:BatchStopJobRun
+            Resource:
+              - "*"
+          - Sid: JobRunAccessSageMaker
+            Effect: Allow
+            Action:
+              - sagemaker:*
+            Resource:
+              - "*"
+          - Sid: RuleManagementEventBridge
+            Effect: Allow
+            Action:
+              - events:*Rule
+              - events:*Rules
+            Resource:
+              - "*"
+      Roles:
+        - !Ref StateMachineExecutionRole
+
+
+##################
+# Glue Resources #
+##################
+
+  AmazonReviewGlueDB:
+    Type: AWS::Glue::Database
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput: 
+        Description: A Glue database for amazon review data
+        Name: amazon_reviews
+
+  RawDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      DatabaseName: !Ref AmazonReviewGlueDB
+      Description: crawls raw amazon review data
+      Name: amazon_review_raw_crawler
+      Role: !Ref GlueCrawlerRole
+      Targets:
+        S3Targets: 
+          - Path: !Sub s3://${DataBucketName}/raw
+
+  DataIngestJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: amazon-review-ingestion
+      Description: Extracts negative reviews and stores them in another location in S3 to build a dataset for the NTM algorithm.
+      Role: !GetAtt GlueIngestionJobRole.Arn
+      MaxRetries: 0
+      Timeout: 120 #minutes
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      GlueVersion: "2.0"
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${ToolsBucketName}/gluejobs/data_ingest.py
+        PythonVersion: "3"
+
+  DataPrepareJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: amazon-review-preparation
+      Description: Shuffles input data and builds train, test, and validation datasets for the NTM algorithm.
+      Role: !GetAtt GlueIngestionJobRole.Arn
+      MaxRetries: 0
+      Timeout: 120 #minutes
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      GlueVersion: "2.0"
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${ToolsBucketName}/gluejobs/data_prepare.py
+        PythonVersion: "3"
+
+###################
+# Other Resources #
+###################
+
+  S3EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: NTM-S3EventRule
+      Description: Triggers the NTM state machine to run when a new file is uploaded
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - PutObject
+            - CompleteMultipartUpload
+          requestParameters:
+            bucketName:
+              - !Ref DataBucketName
+            key:
+              - prefix: raw
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt NtmStateMachine.Arn
+          Id: NTM-StateMachine
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties: 
+      Description: A workgroup for querying amazon review data
+      Name: amazon-review-workgroup
+      RecursiveDeleteOption: True
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration: 
+          OutputLocation: !Sub s3://${DataBucketName}/queries
+
+  NtmStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StateMachineExecutionRole.Arn
+      StateMachineName: !Ref StateMachineName
+      DefinitionString: !Sub
+        - >-
+          {
+            "Comment": "A State Machine to manage ingestion, transformation, training, and updating production NTM resources.",
+            "StartAt": "Ingestion Job",
+            "States": {
+              "Ingestion Job": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                  "Parameters": {
+                      "JobName": "${IngestJob}",
+                      "Arguments": {
+                          "--s3_bucket.$": "$.detail.requestParameters.bucketName",
+                          "--s3_object_key.$": "$.detail.requestParameters.key"
+                      }
+                  },
+                  "ResultPath": "$.ingest",
+                  "OutputPath": "$",
+                  "Next": "Preparation Job"
+              },
+              "Preparation Job": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                  "Parameters": {
+                      "JobName": "${PrepareJob}",
+                      "Arguments": {
+                          "--s3_bucket.$": "$.detail.requestParameters.bucketName",
+                          "--train_percent": "0.8"
+                      }
+                  },
+                  "ResultPath": "$.prepare",
+                  "OutputPath": "$",
+                  "Next": "Processing Job"
+              },
+              "Processing Job": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
+                  "Parameters": {
+                      "AppSpecification": {
+                          "ImageUri": "${Account}.dkr.ecr.${Region}.amazonaws.com/processing-job:latest"
+                      },
+                      "ProcessingResources": {
+                          "ClusterConfig": {
+                              "InstanceCount": 1,
+                              "InstanceType": "ml.m5.2xlarge",
+                              "VolumeSizeInGB": 10
+                          }
+                      },
+                      "RoleArn": "${SMRole}",
+                      "ProcessingJobName.$": "$.id"
+                  },
+                  "ResultPath": "$.process",
+                  "OutputPath": "$",
+                  "Next": "Training Job"
+              },
+              "Training Job": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
+                  "Parameters": {
+                      "TrainingJobName.$": "$.id",
+                      "RoleArn": "${SMRole}",
+                      "ResourceConfig": {
+                          "InstanceCount": 12,
+                          "InstanceType": "ml.c4.xlarge",
+                          "VolumeSizeInGB": 5
+                      },
+                      "HyperParameters": {
+                          "epochs": "70",
+                          "feature_dim": "524",
+                          "mini_batch_size": "300",
+                          "num_topics": "10",
+                          "sub_sample": "0.7"
+                      },
+                      "AlgorithmSpecification": {
+                          "TrainingImage": "174872318107.dkr.ecr.us-west-2.amazonaws.com/ntm:latest",
+                          "TrainingInputMode": "Pipe"
+                      },
+                      "EnableManagedSpotTraining": true,
+                      "OutputDataConfig": {
+                          "S3OutputPath.$": "States.Format('s3://{}/models', $.detail.requestParameters.bucketName)"
+                      },
+                      "StoppingCondition": {
+                          "MaxRuntimeInSeconds": 900,
+                          "MaxWaitTimeInSeconds": 900
+                      },
+                      "InputDataConfig": [{
+                              "ChannelName": "train",
+                              "ContentType": "application/x-recordio-protobuf",
+                              "InputMode": "Pipe",
+                              "DataSource": {
+                                  "S3DataSource": {
+                                      "S3DataType": "S3Prefix",
+                                      "S3Uri.$": "States.Format('s3://{}/processed/train/', $.detail.requestParameters.bucketName)",
+                                      "S3DataDistributionType": "ShardedByS3Key"
+                                  }
+                              }
+                          },
+                          {
+                              "ChannelName": "validation",
+                              "ContentType": "application/x-recordio-protobuf",
+                              "InputMode": "Pipe",
+                              "DataSource": {
+                                  "S3DataSource": {
+                                      "S3DataType": "S3Prefix",
+                                      "S3Uri.$": "States.Format('s3://{}/processed/validation/', $.detail.requestParameters.bucketName)",
+                                      "S3DataDistributionType": "FullyReplicated"
+                                  }
+                              }
+                          },
+                          {
+                              "ChannelName": "test",
+                              "ContentType": "application/x-recordio-protobuf",
+                              "InputMode": "Pipe",
+                              "DataSource": {
+                                  "S3DataSource": {
+                                      "S3DataType": "S3Prefix",
+                                      "S3Uri.$": "States.Format('s3://{}/processed/test/', $.detail.requestParameters.bucketName)",
+                                      "S3DataDistributionType": "ShardedByS3Key"
+                                  }
+                              }
+                          },
+                          {
+                              "ChannelName": "auxiliary",
+                              "ContentType": "text/plain",
+                              "InputMode": "File",
+                              "DataSource": {
+                                  "S3DataSource": {
+                                      "S3DataType": "S3Prefix",
+                                      "S3Uri.$": "States.Format('s3://{}/processed/vocab.txt', $.detail.requestParameters.bucketName)",
+                                      "S3DataDistributionType": "FullyReplicated"
+                                  }
+                              }
+                          }
+                      ]
+                  },
+                  "ResultPath": "$.train",
+                  "OutputPath": "$",
+                  "Next": "Create Model"
+              },
+              "Create Model": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sagemaker:createModel",
+                "Parameters": {
+                  "ModelName.$": "States.Format('ntm-automated-model-{}', $.id)",
+                  "ExecutionRoleArn": "${SMRole}",
+                  "PrimaryContainer": {
+                    "ContainerHostname": "automated-ntm-model",
+                    "Image": "174872318107.dkr.ecr.us-west-2.amazonaws.com/ntm:latest",
+                    "ImageConfig": {
+                      "RepositoryAccessMode": "Platform"
+                    },
+                    "Mode": "SingleModel",
+                    "ModelDataUrl.$": "$.train.ModelArtifacts.S3ModelArtifacts"
+                  }
+                },
+                "ResultPath": "$.model",
+                "OutputPath": "$",
+                "Next": "Batch Inference"
+              },
+              "Batch Inference": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sagemaker:createTransformJob.sync",
+                "Parameters": {
+                  "TransformJobName.$": "States.Format('ntm-automated-transform-{}', $.id)",
+                  "ModelName.$": "States.Format('ntm-automated-model-{}', $.id)",
+                  "BatchStrategy": "MultiRecord",
+                  "TransformInput": {
+                    "CompressionType": "None",
+                    "ContentType": "text/csv",
+                    "DataSource": {
+                      "S3DataSource": {
+                        "S3DataType": "S3Prefix",
+                        "S3Uri.$": "States.Format('s3://{}/processed/demo.csv', $.detail.requestParameters.bucketName)"
+                      }
+                    },
+                    "SplitType": "Line"
+                  },
+                  "TransformOutput": {
+                    "Accept": "text/csv",
+                    "AssembleWith": "Line",
+                    "S3OutputPath.$": "States.Format('s3://{}/inferences', $.detail.requestParameters.bucketName)"
+                  },
+                  "TransformResources": {
+                    "InstanceCount": 1,
+                    "InstanceType": "ml.m4.xlarge"
+                  }
+                },
+                "ResultPath": "$.batch",
+                "OutputPath": "$",
+                "End": true
+              }
+            }
+          }
+        - IngestJob: !Ref DataIngestJob
+          PrepareJob: !Ref DataPrepareJob
+          SMRole: !GetAtt SageMakerExecutionRole.Arn
+          Account: !Ref AWS::AccountId
+          Region: !Ref AWS::Region
