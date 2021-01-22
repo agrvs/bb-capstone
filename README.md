@@ -15,6 +15,8 @@ There are two videos, one is the short version I submitted with the capstone and
 
 This project is still a work in progress, so there will be additional updates/changes in the future.
 
+There is a recorded demonstration of this project in action here: [Full Workflow Demo](https://youtu.be/RlIiNQy-vNM)
+
 **Deployment:**
 
 1. choose new bucket names in params.ini
